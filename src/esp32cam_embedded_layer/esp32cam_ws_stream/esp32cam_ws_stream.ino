@@ -29,9 +29,9 @@
 
 // ============== OPTIMIZED SETTINGS ==============
 #define STREAM_FRAMESIZE  FRAMESIZE_QVGA   // 320x240
-#define STREAM_QUALITY    15               // Lower quality = faster
+#define STREAM_QUALITY    20               // Lower quality (higher number) = smaller packet size, preventing "Corrupt JPEG"
 #define CAPTURE_FRAMESIZE FRAMESIZE_VGA    // 640x480
-#define CAPTURE_QUALITY   10               // Higher quality for recognition
+#define CAPTURE_QUALITY   4               // Good balance for recognition
 #define RESUME_TIMEOUT_MS 15000            // Auto-resume after 15 seconds
 // ================================================
 

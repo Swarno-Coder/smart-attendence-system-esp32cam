@@ -13,17 +13,41 @@ import copy
 import time
 import cv2
 import os
+import json
 from collections import deque
 from datetime import datetime
+
+# Backend client for face recognition
+from backend_client import FaceRecognitionClient, get_client, close_client
 
 # ============== FACE DETECTION CONFIG ==============
 FACE_DETECTION_ENABLED = True
 FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 MIN_FACE_SIZE = (30, 30)
 DETECTION_SCALE_FACTOR = 1.1
-MIN_NEIGHBORS = 4
+MIN_NEIGHBORS = 3       # Reduced from 4 for better detection recall
+CAPTURE_STABILITY_FRAMES = 3  # Number of valid frames required before capture
 COOLDOWN_SECONDS = 3
-# ===================================================
+
+# ============== BACKEND CONFIG ==============
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+BACKEND_ENABLED = True
+# =============================================
+
+# ============== FACE GUIDE CONFIG ==============
+# Guide oval settings (as percentage of frame dimensions after rotation)
+GUIDE_CENTER_X_PCT = 0.5    # Horizontal center
+GUIDE_CENTER_Y_PCT = 0.40   # Slightly above vertical center
+GUIDE_WIDTH_PCT = 0.55      # Oval width as % of frame width
+GUIDE_HEIGHT_PCT = 0.45     # Oval height as % of frame height
+# Relaxed tolerance - face just needs to be "around" the oval
+GUIDE_TOLERANCE = 0.5       # Face can be within 50% of guide boundary (Balanced)
+MIN_FACE_SIZE_IN_GUIDE = 0.25  # Smaller minimum for more flexibility
+MAX_FACE_SIZE_IN_GUIDE = 1.5   # Larger maximum for closer faces
+# Recognition timing
+RESULT_DISPLAY_SECONDS = 2  # How long to show result before resuming stream
+BACKEND_TIMEOUT_SECONDS = 10  # Timeout for backend response
+# ===============================================
 
 face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
 if face_cascade.empty():
@@ -34,6 +58,7 @@ else:
 
 lock = threading.Lock()
 connectedDevices = set()
+backend_client: FaceRecognitionClient = None
 hq_captures = {}
 
 
@@ -51,11 +76,24 @@ class WSHandler(tornado.websocket.WebSocketHandler):
         self.last_stream_frame = None  # Store last QVGA frame before HQ capture
         self.awaiting_hq_frame = False  # Flag: next binary is HQ frame
         self.stream_paused = False  # Track if stream is paused
+        self.face_in_guide = False  # Track if face is aligned with guide
+        self.stability_counter = 0  # Track consecutive valid frames
+        
+        # Recognition state management
+        # States: 'streaming', 'processing', 'success', 'error', 'timeout'
+        self.recognition_state = 'streaming'
+        self.recognition_result = None
+        self.recognition_person_name = ''
+        self.recognition_message = ''
+        self.recognition_start_time = 0
+        self.state_change_time = 0
 
     def detect_faces(self, frame):
         if not FACE_DETECTION_ENABLED or frame is None:
             return []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)  # Improvement: Contrast enhancement for low light
+        
         faces = face_cascade.detectMultiScale(
             gray,
             scaleFactor=DETECTION_SCALE_FACTOR,
@@ -70,29 +108,151 @@ class WSHandler(tornado.websocket.WebSocketHandler):
             return
         
         self.rawFrame = self.frame.copy()
+        # Face detection on original QVGA frame for performance
         self.faces_detected = self.detect_faces(self.rawFrame)
         
-        frame = imutils.rotate_bound(self.frame.copy(), 90)
+        # Reset alignment flag for this frame processing cycle
+        any_face_aligned = False
         
-        # Draw face rectangles
+        # Rotate the frame first
+        frame_rotated = imutils.rotate_bound(self.frame.copy(), 90)
+        orig_h, orig_w = frame_rotated.shape[:2]
+        
+        # Upscale display frame 2x using bicubic interpolation for better quality
+        SCALE_FACTOR = 2
+        display_frame = cv2.resize(frame_rotated, (orig_w * SCALE_FACTOR, orig_h * SCALE_FACTOR), 
+                                   interpolation=cv2.INTER_CUBIC)
+        display_h, display_w = display_frame.shape[:2]
+        
+        # Guide oval parameters (calculated on upscaled frame dim)
+        guide_center_x = int(display_w * GUIDE_CENTER_X_PCT)
+        guide_center_y = int(display_h * GUIDE_CENTER_Y_PCT)
+        guide_width = int(display_w * GUIDE_WIDTH_PCT)
+        guide_height = int(display_h * GUIDE_HEIGHT_PCT)
+        guide_axes = (guide_width // 2, guide_height // 2)
+        
+        face_alignment_status = "Waiting for face..."
+        
         if len(self.faces_detected) > 0:
-            h, w = self.rawFrame.shape[:2]
-            for (x, y, fw, fh) in self.faces_detected:
-                new_x = y
-                new_y = w - x - fw
-                new_w = fh
-                new_h = fw
-                color = (0, 0, 255) if is_hq else (0, 255, 0)  # Red for HQ, Green for stream
-                cv2.rectangle(frame, (new_x, new_y), (new_x + new_w, new_y + new_h), color, 2)
-                label = "HQ CAPTURE" if is_hq else "FACE"
-                cv2.putText(frame, label, (new_x, new_y - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            frame_h_raw, frame_w_raw = self.rawFrame.shape[:2]
+            
+            for (x, y, w, h) in self.faces_detected:
+                # Rotate coordinates logic
+                new_x = frame_h_raw - y - h
+                new_y = x
+                new_w = h
+                new_h = w
+                
+                # Calculate face center relative to guide
+                face_center_x = new_x + new_w // 2
+                face_center_y = new_y + new_h // 2
+                
+                # Check alignment with upscaled guide coordinates
+                face_center_x_up = face_center_x * SCALE_FACTOR
+                face_center_y_up = face_center_y * SCALE_FACTOR
+                face_w_up = new_w * SCALE_FACTOR
+                face_h_up = new_h * SCALE_FACTOR
+                
+                # Deviation from guide center (normalized by guide semi-axes)
+                dx = abs(face_center_x_up - guide_center_x) / (guide_width / 2)
+                dy = abs(face_center_y_up - guide_center_y) / (guide_height / 2)
+                
+                # Check if face size is appropriate
+                face_size = max(new_w, new_h) * SCALE_FACTOR
+                guide_ref_size = min(guide_width, guide_height)
+                size_ratio = face_size / guide_ref_size
+                
+                # Determine if face is aligned
+                position_ok = dx < GUIDE_TOLERANCE and dy < GUIDE_TOLERANCE
+                size_ok = MIN_FACE_SIZE_IN_GUIDE < size_ratio < MAX_FACE_SIZE_IN_GUIDE
+                
+                color = (0, 0, 255) # Default Red
+                
+                if position_ok:
+                    any_face_aligned = True # Mark as aligned for stability
+                    color = (0, 255, 0) # Green (Visual feedback immediate)
+                    
+                    if self.stability_counter >= CAPTURE_STABILITY_FRAMES:
+                         face_alignment_status = "CAPTURING..."
+                    else:
+                         dots = "." * (self.stability_counter + 1)
+                         face_alignment_status = f"Hold still{dots}"
+                         
+                elif size_ratio < MIN_FACE_SIZE_IN_GUIDE:
+                    color = (0, 255, 255)  # Yellow
+                    face_alignment_status = "Move closer"
+                elif position_ok and not size_ok: 
+                     color = (0, 165, 255)  # Orange
+                     face_alignment_status = "Move back"
+                else:
+                    face_alignment_status = "Center your face"
+                    
+                if is_hq:
+                    color = (255, 0, 255)
+                
+                # Draw Box
+                disp_x = new_x * SCALE_FACTOR
+                disp_y = new_y * SCALE_FACTOR
+                disp_w = new_w * SCALE_FACTOR
+                disp_h = new_h * SCALE_FACTOR
+                
+                cv2.rectangle(display_frame, (disp_x, disp_y), (disp_x + disp_w, disp_y + disp_h), color, 2)
+                label = "HQ CAPTURE" if is_hq else ("ALIGNED" if any_face_aligned else "FACE")
+                cv2.putText(display_frame, label, (disp_x, disp_y - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Update stability counter
+        if any_face_aligned:
+             self.stability_counter = min(self.stability_counter + 1, CAPTURE_STABILITY_FRAMES + 1)
+        else:
+             self.stability_counter = 0 # Reset if alignment lost
+             
+        # Set trigger flag only if stable
+        self.face_in_guide = (self.stability_counter >= CAPTURE_STABILITY_FRAMES)
         
-        # Add status overlay
+        # Guide Overlay
+        guide_color = (0, 255, 0) if any_face_aligned else (255, 255, 255)
+        guide_thick = 4 if self.face_in_guide else 2
+        cv2.ellipse(display_frame, (guide_center_x, guide_center_y), guide_axes, 0, 0, 360, guide_color, guide_thick)
+        
+        # Draw corners
+        corner_len = 25
+        # Top-left
+        cv2.line(display_frame, (guide_center_x - guide_axes[0], guide_center_y - guide_axes[1] + corner_len),
+                 (guide_center_x - guide_axes[0], guide_center_y - guide_axes[1]), guide_color, 2)
+        cv2.line(display_frame, (guide_center_x - guide_axes[0], guide_center_y - guide_axes[1]),
+                 (guide_center_x - guide_axes[0] + corner_len, guide_center_y - guide_axes[1]), guide_color, 2)
+        # Top-right
+        cv2.line(display_frame, (guide_center_x + guide_axes[0], guide_center_y - guide_axes[1] + corner_len),
+                 (guide_center_x + guide_axes[0], guide_center_y - guide_axes[1]), guide_color, 2)
+        cv2.line(display_frame, (guide_center_x + guide_axes[0], guide_center_y - guide_axes[1]),
+                 (guide_center_x + guide_axes[0] - corner_len, guide_center_y - guide_axes[1]), guide_color, 2)
+        # Bottom-left
+        cv2.line(display_frame, (guide_center_x - guide_axes[0], guide_center_y + guide_axes[1] - corner_len),
+                 (guide_center_x - guide_axes[0], guide_center_y + guide_axes[1]), guide_color, 2)
+        cv2.line(display_frame, (guide_center_x - guide_axes[0], guide_center_y + guide_axes[1]),
+                 (guide_center_x - guide_axes[0] + corner_len, guide_center_y + guide_axes[1]), guide_color, 2)
+        # Bottom-right
+        cv2.line(display_frame, (guide_center_x + guide_axes[0], guide_center_y + guide_axes[1] - corner_len),
+                 (guide_center_x + guide_axes[0], guide_center_y + guide_axes[1]), guide_color, 2)
+        cv2.line(display_frame, (guide_center_x + guide_axes[0], guide_center_y + guide_axes[1]),
+                 (guide_center_x + guide_axes[0] - corner_len, guide_center_y + guide_axes[1]), guide_color, 2)
+        
+        # Status Overlay
         status = "HQ CAPTURE" if is_hq else ("PAUSED" if self.stream_paused else "STREAMING")
-        cv2.putText(frame, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(display_frame, status, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        (flag, encodedImage) = cv2.imencode(".jpg", frame)
+        # Alignment Instructions
+        text_size = cv2.getTextSize(face_alignment_status, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = (display_w - text_size[0]) // 2
+        text_y = display_h - 20
+        cv2.rectangle(display_frame, (text_x - 8, text_y - text_size[1] - 8), 
+                     (text_x + text_size[0] + 8, text_y + 8), (0, 0, 0), -1)
+        text_color = (0, 255, 0) if any_face_aligned else (255, 255, 255)
+        cv2.putText(display_frame, face_alignment_status, (text_x, text_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+        
+        (flag, encodedImage) = cv2.imencode(".jpg", display_frame)
         if not flag:
             return
         
@@ -139,10 +299,20 @@ class WSHandler(tornado.websocket.WebSocketHandler):
         if self.awaiting_hq_frame:
             # This is the HQ VGA frame
             print(f"Received HQ frame: {frame_size} bytes")
+            
+            # Store raw JPEG bytes for backend
+            self.hq_raw_bytes = message
+            
             tornado.ioloop.IOLoop.current().run_in_executor(
                 self.executor, lambda: self.process_frames(is_hq=True)
             )
             self.awaiting_hq_frame = False
+            
+            # Send HQ frame to backend for recognition
+            if BACKEND_ENABLED and backend_client:
+                tornado.ioloop.IOLoop.current().add_callback(
+                    self.send_to_backend, message
+                )
             
             # Send RESUME_STREAM command
             tornado.ioloop.IOLoop.current().add_callback(self.send_resume_stream)
@@ -157,14 +327,15 @@ class WSHandler(tornado.websocket.WebSocketHandler):
             # Process frame synchronously (face detection is fast enough for QVGA)
             self.process_frames(is_hq=False)
             
-            # Now check for faces AFTER processing
-            if FACE_DETECTION_ENABLED and len(self.faces_detected) > 0 and not self.stream_paused:
+            # Now check for faces AFTER processing - only capture if face is aligned in guide
+            if FACE_DETECTION_ENABLED and self.face_in_guide and not self.stream_paused:
                 current_time = time.time()
                 if current_time - self.last_hq_capture_time > COOLDOWN_SECONDS:
                     self.last_hq_capture_time = current_time
                     self.write_message("CAPTURE_HQ")
                     self.stream_paused = True
-                    print(f"[{self.id}] Face detected! Sending CAPTURE_HQ")
+                    self.stability_counter = 0  # Reset stability counter to require fresh confirmation
+                    print(f"[{self.id}] Face aligned in guide! Sending CAPTURE_HQ")
     
     def send_resume_stream(self):
         """Send RESUME_STREAM command after a brief delay"""
@@ -174,6 +345,127 @@ class WSHandler(tornado.websocket.WebSocketHandler):
             print(f"Sent RESUME_STREAM to {self.id}")
         except Exception as e:
             print(f"Error sending RESUME_STREAM: {e}")
+    
+    async def send_to_backend(self, image_bytes: bytes):
+        """
+        Send HQ image to backend for face recognition.
+        Manages recognition state and handles timeout.
+        """
+        global backend_client
+        
+        if not backend_client:
+            print(f"[{self.id}] Backend client not available")
+            self.recognition_state = 'error'
+            self.recognition_message = 'Backend not available'
+            self.state_change_time = time.time()
+            self.schedule_resume()
+            return
+        
+        # Set processing state
+        self.recognition_state = 'processing'
+        self.recognition_start_time = time.time()
+        self.state_change_time = time.time()
+        
+        try:
+            print(f"[{self.id}] Sending {len(image_bytes)} bytes to backend...")
+            
+            # Add timeout to backend call
+            import asyncio
+            try:
+                result = await asyncio.wait_for(
+                    backend_client.recognize_face(image_bytes),
+                    timeout=BACKEND_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                print(f"[{self.id}] Backend timeout after {BACKEND_TIMEOUT_SECONDS}s")
+                self.recognition_state = 'timeout'
+                self.recognition_message = f'Backend timeout ({BACKEND_TIMEOUT_SECONDS}s)'
+                self.state_change_time = time.time()
+                self.schedule_resume()
+                return
+            
+            # Store recognition result
+            self.last_recognition_result = result
+            self.recognition_result = result
+            
+            if result.get('success'):
+                face_match = result.get('face_match', {})
+                person_name = face_match.get('person_name', 'Unknown')
+                similarity = face_match.get('similarity', 0)
+                print(f"[{self.id}] RECOGNIZED: {person_name} (similarity: {similarity:.2f})")
+                
+                # Set success state
+                self.recognition_state = 'success'
+                self.recognition_person_name = person_name
+                self.recognition_message = f'Welcome, {person_name}!'
+                self.state_change_time = time.time()
+                
+                # Send recognition result back to ESP32-CAM
+                self.write_message(json.dumps({
+                    "type": "recognition_result",
+                    "success": True,
+                    "person_name": person_name,
+                    "similarity": similarity
+                }))
+            else:
+                liveness = result.get('liveness', {})
+                message = result.get('message', 'Unknown error')
+                
+                if not liveness.get('is_live', True):
+                    print(f"[{self.id}] SPOOF DETECTED: {liveness.get('message', 'Not live')}")
+                    self.recognition_message = 'Spoof detected - Not a real face'
+                else:
+                    print(f"[{self.id}] NOT RECOGNIZED: {message}")
+                    self.recognition_message = message
+                
+                # Set error state
+                self.recognition_state = 'error'
+                self.recognition_person_name = ''
+                self.state_change_time = time.time()
+                
+                # Send failure result back to ESP32-CAM
+                self.write_message(json.dumps({
+                    "type": "recognition_result",
+                    "success": False,
+                    "message": message,
+                    "is_live": liveness.get('is_live', False)
+                }))
+                
+            # Store in captures with recognition result
+            hq_captures[self.id] = {
+                'image': self.hq_frame,
+                'timestamp': datetime.now(),
+                'faces': len(self.faces_detected),
+                'recognition': result
+            }
+            
+            print(f"[{self.id}] Processing time: {result.get('processing_time_ms', 0):.1f}ms")
+            
+            # Schedule auto-resume after showing result
+            self.schedule_resume()
+            
+        except Exception as e:
+            print(f"[{self.id}] Backend error: {e}")
+            self.recognition_state = 'error'
+            self.recognition_message = f'Error: {str(e)}'
+            self.state_change_time = time.time()
+            self.schedule_resume()
+    
+    def schedule_resume(self):
+        """Schedule stream resume after RESULT_DISPLAY_SECONDS"""
+        tornado.ioloop.IOLoop.current().call_later(
+            RESULT_DISPLAY_SECONDS,
+            self.resume_after_result
+        )
+    
+    def resume_after_result(self):
+        """Resume streaming after showing recognition result"""
+        print(f"[{self.id}] Resuming stream after result display")
+        self.recognition_state = 'streaming'
+        self.recognition_result = None
+        self.recognition_person_name = ''
+        self.recognition_message = ''
+        self.send_resume_stream()
 
     def on_close(self):
         print('connection closed')
@@ -280,7 +572,10 @@ class DevicesHandler(tornado.web.RequestHandler):
                     "connected": True,
                     "faces_detected": len(c.faces_detected) if hasattr(c, 'faces_detected') else 0,
                     "stream_paused": c.stream_paused,
-                    "has_hq_capture": c.id in hq_captures
+                    "has_hq_capture": c.id in hq_captures,
+                    "recognition_state": getattr(c, 'recognition_state', 'streaming'),
+                    "recognition_person_name": getattr(c, 'recognition_person_name', ''),
+                    "recognition_message": getattr(c, 'recognition_message', '')
                 })
         self.write({"devices": devices, "count": len(devices), "detection_enabled": FACE_DETECTION_ENABLED})
 
@@ -303,130 +598,366 @@ class CapturesViewHandler(tornado.web.RequestHandler):
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Face Detection Pipeline</title>
+    <title>Smart Attendance System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        * { box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Arial, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #eee; padding: 20px; margin: 0; min-height: 100vh; }
-        h1 { color: #00d4ff; margin-bottom: 5px; }
-        .subtitle { color: #888; margin-bottom: 20px; }
-        .container { display: flex; gap: 20px; flex-wrap: wrap; }
-        .box { background: rgba(22, 33, 62, 0.9); border-radius: 15px; padding: 20px; box-shadow: 0 8px 32px rgba(0,212,255,0.15); backdrop-filter: blur(10px); border: 1px solid rgba(0,212,255,0.2); flex: 1; min-width: 300px; }
-        .box h2 { color: #00d4ff; margin-top: 0; font-size: 1.1em; display: flex; align-items: center; gap: 8px; }
-        img { max-width: 100%; border-radius: 8px; background: #000; }
-        .status { padding: 8px 15px; border-radius: 20px; display: inline-block; font-weight: bold; margin: 10px 0; }
-        .status.streaming { background: #00c853; color: #000; }
-        .status.paused { background: #ff9800; color: #000; }
-        .status.waiting { background: #2196f3; color: #fff; }
-        .status.offline { background: #f44336; color: #fff; }
-        .info-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 15px; }
-        .info-item { background: rgba(0,212,255,0.1); padding: 10px; border-radius: 8px; text-align: center; }
-        .info-item .label { font-size: 0.8em; color: #888; }
-        .info-item .value { font-size: 1.5em; color: #00d4ff; font-weight: bold; }
-        .capture-time { font-size: 0.9em; color: #888; margin-top: 10px; }
-        #hq-image { min-height: 200px; display: flex; align-items: center; justify-content: center; color: #666; }
+        :root {
+            --bg-color: #1a1a2e;
+            --card-bg: rgba(22, 33, 62, 0.9);
+            --primary: #00d4ff;
+            --success: #00ff88;
+            --error: #ff3366;
+            --text-main: #ffffff;
+            --text-sub: #8892b0;
+        }
+
+        body {
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: var(--text-main);
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            transition: background 0.5s ease;
+        }
+
+        /* Dynamic Theme Classes */
+        body.theme-success {
+            background: linear-gradient(135deg, #051c10, #0c3a23, #022010);
+        }
+        body.theme-error {
+            background: linear-gradient(135deg, #2a0a10, #4a1218, #200508);
+        }
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 30px;
+            width: 90%;
+            max-width: 1200px;
+            height: 85vh;
+        }
+
+        .video-section {
+            background: var(--card-bg);
+            border-radius: 24px;
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.1);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            padding: 20px 30px;
+            background: rgba(0,0,0,0.2);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+            color: var(--primary);
+        }
+        
+        .theme-success .header h1 { color: var(--success); }
+        .theme-error .header h1 { color: var(--error); }
+
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9rem;
+            color: var(--text-sub);
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .dot {
+            width: 10px;
+            height: 10px;
+            background-color: var(--error);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--error);
+        }
+        
+        .active .dot {
+            background-color: var(--success);
+            box-shadow: 0 0 10px var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        .video-container {
+            flex: 1;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+            overflow: hidden;
+        }
+
+        #video-feed, #captured-image {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            position: absolute;
+            top: 0;
+            left: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        /* Visibility Toggles */
+        .show-video #captured-image { opacity: 0; z-index: 1; }
+        .show-video #video-feed { opacity: 1; z-index: 2; }
+        
+        .show-capture #video-feed { opacity: 0; z-index: 1; }
+        .show-capture #captured-image { opacity: 1; z-index: 2; }
+
+        .status-panel {
+            background: var(--card-bg);
+            border-radius: 24px;
+            padding: 40px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            transition: all 0.3s ease;
+        }
+        
+        .theme-success .status-panel { border-color: rgba(0, 255, 136, 0.3); background: rgba(0, 50, 25, 0.8); }
+        .theme-error .status-panel { border-color: rgba(255, 51, 102, 0.3); background: rgba(50, 10, 20, 0.8); }
+
+        /* Status Animations */
+        .loader {
+            position: relative;
+            width: 120px;
+            height: 120px;
+            margin-bottom: 30px;
+        }
+
+        .ring {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            border: 4px solid transparent;
+            border-top-color: var(--primary);
+            animation: spin 1s linear infinite;
+        }
+        
+        .ring:nth-child(2) {
+            width: 80%;
+            height: 80%;
+            top: 10%;
+            left: 10%;
+            border-top-color: #ff00ff;
+            animation: spin 1.5s linear infinite reverse;
+        }
+
+        /* Success Icon */
+        .icon-box {
+            font-size: 5rem;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .success-icon { color: var(--success); }
+        .error-icon { color: var(--error); }
+
+        .status-text {
+            font-size: 1.2rem;
+            color: var(--text-sub);
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        .result-text {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--text-main);
+            margin: 0;
+            text-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+
+        /* State specific visibility */
+        .state-streaming .loader { display: none; }
+        .state-streaming .icon-box { display: none; }
+        .state-streaming .result-text { display: none; }
+        
+        .state-processing .loader { display: block; }
+        .state-processing .icon-box { display: none; }
+        
+        .state-success .loader { display: none; }
+        .state-success .icon-box.success-icon { display: block; filter: drop-shadow(0 0 20px var(--success)); }
+        
+        .state-error .loader { display: none; }
+        .state-error .icon-box.error-icon { display: block; filter: drop-shadow(0 0 20px var(--error)); }
+        
+        /* Guide text overlay */
+        .guide-overlay {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0,0,0,0.6);
+            padding: 10px 20px;
+            border-radius: 20px;
+            color: #fff;
+            font-size: 1.1rem;
+            z-index: 10;
+            border: 1px solid rgba(255,255,255,0.2);
+            pointer-events: none;
+        }
+
     </style>
 </head>
-<body>
-    <h1>🎯 Face Detection Pipeline</h1>
-    <p class="subtitle">ESP32-CAM → Face Detection → HQ Capture → Cloud Ready</p>
-    
-    <div class="container">
-        <div class="box">
-            <h2>📹 Live Stream (QVGA)</h2>
-            <div id="stream-status" class="status offline">Connecting...</div>
-            <img id="stream" src="/video_feed/deviceId" onerror="this.style.opacity='0.3'">
-            <div class="info-grid">
-                <div class="info-item">
-                    <div class="label">Faces</div>
-                    <div class="value" id="face-count">0</div>
+<body class="theme-default">
+    <div class="dashboard">
+        <!-- Video Section -->
+        <div class="video-section">
+            <div class="header">
+                <h1>SMART ATTENDANCE</h1>
+                <div class="live-indicator active">
+                    <div class="dot"></div>
+                    <span id="conn-status">LIVE SYSTEM</span>
                 </div>
-                <div class="info-item">
-                    <div class="label">State</div>
-                    <div class="value" id="stream-state">-</div>
-                </div>
+            </div>
+            
+            <div class="video-container show-video" id="video-wrapper">
+                <img id="video-feed" src="" alt="Video Feed">
+                <img id="captured-image" src="" alt="Captured Frame">
+                <div class="guide-overlay" id="guide-msg">Ready for attendance</div>
             </div>
         </div>
-        
-        <div class="box">
-            <h2>📸 HQ Capture (VGA)</h2>
-            <div id="hq-status" class="status waiting">Waiting for face...</div>
-            <div id="hq-image">
-                <img id="hq-capture" style="display:none;">
-                <span id="hq-placeholder">No capture yet</span>
+
+        <!-- Status Panel -->
+        <div class="status-panel state-streaming" id="status-panel">
+            <!-- Processing Animation -->
+            <div class="loader">
+                <div class="ring"></div>
+                <div class="ring"></div>
             </div>
-            <div class="capture-time" id="capture-time"></div>
-            <div class="info-grid">
-                <div class="info-item">
-                    <div class="label">Captures</div>
-                    <div class="value" id="capture-count">0</div>
-                </div>
-                <div class="info-item">
-                    <div class="label">Faces in HQ</div>
-                    <div class="value" id="hq-faces">-</div>
-                </div>
-            </div>
+
+            <!-- Success Icon -->
+            <div class="icon-box success-icon">✓</div>
+            
+            <!-- Error Icon -->
+            <div class="icon-box error-icon">✗</div>
+
+            <div class="status-text" id="status-label">SYSTEM READY</div>
+            <h2 class="result-text" id="result-label">Waiting...</h2>
         </div>
     </div>
-    
+
     <script>
-        async function updateStatus() {
+        const videoWrapper = document.getElementById('video-wrapper');
+        const videoFeed = document.getElementById('video-feed');
+        const capturedImage = document.getElementById('captured-image');
+        const statusPanel = document.getElementById('status-panel');
+        const statusLabel = document.getElementById('status-label');
+        const resultLabel = document.getElementById('result-label');
+        const guideMsg = document.getElementById('guide-msg');
+        
+        let currentDeviceId = null;
+        let activeStreamId = null;
+        let lastState = 'streaming';
+
+        async function updateDashboard() {
             try {
                 const res = await fetch('/devices');
                 const data = await res.json();
                 
                 if (data.devices.length > 0) {
-                    const d = data.devices[0];
-                    document.getElementById('face-count').textContent = d.faces_detected;
-                    document.getElementById('stream-state').textContent = d.stream_paused ? 'PAUSED' : 'LIVE';
+                    const device = data.devices[0];
+                    currentDeviceId = device.id;
                     
-                    const statusEl = document.getElementById('stream-status');
-                    if (d.stream_paused) {
-                        statusEl.className = 'status paused';
-                        statusEl.textContent = 'Capturing HQ...';
-                    } else {
-                        statusEl.className = 'status streaming';
-                        statusEl.textContent = 'Streaming';
+                    // Update video feed URL only if device changed
+                    if (activeStreamId !== device.id) {
+                        console.log("Switching stream to:", device.id);
+                        videoFeed.src = '/video_feed/' + encodeURIComponent(device.id);
+                        activeStreamId = device.id;
                     }
                     
-                    if (d.has_hq_capture) {
-                        document.getElementById('hq-status').className = 'status streaming';
-                        document.getElementById('hq-status').textContent = 'Captured!';
-                    }
+                    const state = device.recognition_state;
+                    
+                    // Handle State Changes
+                    updateUIState(state, device);
+                    
                 } else {
-                    document.getElementById('stream-status').className = 'status offline';
-                    document.getElementById('stream-status').textContent = 'No device';
+                    statusLabel.textContent = "OFFLINE";
+                    resultLabel.textContent = "No Device";
                 }
             } catch (e) {
-                console.error('Status update error:', e);
+                console.error("Dashboard update error:", e);
             }
         }
-        
-        async function updateCaptures() {
-            try {
-                const res = await fetch('/captures');
-                const data = await res.json();
-                document.getElementById('capture-count').textContent = data.count;
+
+        function updateUIState(state, device) {
+            // Update classes
+            statusPanel.className = 'status-panel state-' + state;
+            
+            // Theme reset/set
+            if (state === 'success') {
+                document.body.className = 'theme-success';
+            } else if (state === 'error' || state === 'timeout') {
+                document.body.className = 'theme-error';
+            } else {
+                document.body.className = 'theme-default';
+            }
+
+            // UI Content Update
+            if (state === 'streaming') {
+                videoWrapper.className = 'video-container show-video';
+                statusLabel.textContent = "READY";
+                resultLabel.textContent = "Look at Camera";
+                guideMsg.style.display = 'block';
+                guideMsg.textContent = "Position face in oval";
                 
-                if (data.count > 0) {
-                    const latest = data.captures[data.captures.length - 1];
-                    document.getElementById('hq-faces').textContent = latest.faces;
-                    document.getElementById('capture-time').textContent = 'Last: ' + new Date(latest.timestamp).toLocaleTimeString();
-                    
-                    // Refresh HQ image
-                    const img = document.getElementById('hq-capture');
-                    img.src = '/hq_frame/' + latest.device_id + '?' + Date.now();
-                    img.style.display = 'block';
-                    document.getElementById('hq-placeholder').style.display = 'none';
-                }
-            } catch (e) {
-                console.error('Captures update error:', e);
+            } else if (state === 'processing') {
+                videoWrapper.className = 'video-container show-capture';
+                // Update capture image
+                capturedImage.src = '/hq_frame/' + device.id + '?' + Date.now(); // Force refresh
+                
+                statusLabel.textContent = "PROCESSING";
+                resultLabel.textContent = "Identifying...";
+                guideMsg.style.display = 'none';
+                
+            } else if (state === 'success') {
+                videoWrapper.className = 'video-container show-capture';
+                statusLabel.textContent = "TOTAL SUCCESS";
+                resultLabel.textContent = device.recognition_person_name;
+                guideMsg.style.display = 'none';
+                
+            } else if (state === 'error' || state === 'timeout') {
+                videoWrapper.className = 'video-container show-capture';
+                statusLabel.textContent = "ACCESS DENIED";
+                resultLabel.textContent = device.recognition_message || "Not Recognized";
+                guideMsg.style.display = 'none';
             }
+            
+            lastState = state;
         }
-        
-        setInterval(updateStatus, 500);
-        setInterval(updateCaptures, 1000);
-        updateStatus();
-        updateCaptures();
+
+        // Start polling
+        setInterval(updateDashboard, 500);
+        updateDashboard();
     </script>
 </body>
 </html>
@@ -468,19 +999,46 @@ def get_all_ips():
     return ips
 
 
+async def init_backend_client():
+    """Initialize backend client on startup."""
+    global backend_client
+    backend_client = get_client(BACKEND_URL)
+    
+    # Check backend health
+    health = await backend_client.health_check()
+    if health.get('status') == 'online':
+        print(f'✓ Backend connected: {BACKEND_URL}')
+        print(f'  - Liveness model: {"✓" if health.get("liveness_model") else "✗"}')
+        print(f'  - Face recognition: {"✓" if health.get("face_recognition_model") else "✗"}')
+        print(f'  - Known faces: {health.get("known_faces_count", 0)}')
+    else:
+        print(f'✗ Backend not available: {health.get("error", "Unknown error")}')
+        if not BACKEND_ENABLED:
+            print('  (BACKEND_ENABLED is False - recognition disabled)')
+
+
 if __name__ == "__main__":
     http_server = tornado.httpserver.HTTPServer(application)
     http_server.listen(3000, address="0.0.0.0")
     
     print('=' * 60)
-    print('*** Face Detection Pipeline Server - Port 3000 ***')
+    print('*** Face Detection + Recognition Pipeline Server ***')
     print('=' * 60)
     print(f'\nFace Detection: {"ENABLED" if FACE_DETECTION_ENABLED else "DISABLED"}')
+    print(f'Backend: {BACKEND_URL}')
     print(f'Cooldown: {COOLDOWN_SECONDS}s between captures')
-    print('\nState Machine Flow:')
-    print('  STREAMING -> Face Detected -> CAPTURE_HQ -> PAUSED')
-    print('  -> HQ_FRAME_START -> Receive VGA -> RESUME_STREAM -> STREAMING')
+    print('\nPipeline Flow:')
+    print('  1. ESP32-CAM -> QVGA Stream -> Face Detection (Haar Cascade)')
+    print('  2. Face Detected -> CAPTURE_HQ -> VGA Frame')
+    print('  3. HQ Frame -> Backend API:')
+    print('     a. Liveness Check (MiniFASNetV2)')
+    print('     b. Face Recognition (InsightFace buffalo_l)')
+    print('     c. Cosine Similarity (512D embeddings)')
+    print('  4. Recognition Result -> Back to ESP32-CAM')
     print('\nDashboard: http://localhost:3000/view')
     print('=' * 60)
+    
+    # Initialize backend client
+    tornado.ioloop.IOLoop.current().run_sync(init_backend_client)
     
     tornado.ioloop.IOLoop.current().start()

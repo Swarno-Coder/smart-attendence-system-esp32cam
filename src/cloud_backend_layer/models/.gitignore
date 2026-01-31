@@ -1,0 +1,11 @@
+# Model weights - do not commit to git
+*.pth
+*.pt
+*.onnx
+*.bin
+*.weights
+
+# InsightFace models
+buffalo_l/
+buffalo_s/
+antelopev2/

@@ -1,0 +1,25 @@
+# Face Recognition Backend Requirements
+# ======================================
+
+# FastAPI Backend
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# AI/ML Models
+torch>=2.0.0
+torchvision>=0.15.0
+insightface>=0.7.3
+onnxruntime-gpu>=1.16.0  # For InsightFace inference (use onnxruntime for CPU-only)
+
+# Image Processing
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Async HTTP Client (for local gateway)
+aiohttp>=3.9.0
+
+# Utilities
+python-dotenv>=1.0.0
