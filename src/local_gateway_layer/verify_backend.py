@@ -10,7 +10,8 @@ sys.path.append(str(current_dir))
 
 from backend_client import FaceRecognitionClient
 
-TEST_IMAGES_DIR = current_dir.parent / "cloud_backend_layer" / "TEST"
+# TEST_IMAGES_DIR = current_dir.parent / "cloud_backend_layer" / "TEST"
+TEST_IMAGES_DIR = current_dir.parent / "local_gateway_layer" /"captures"
 
 async def main():
     print(f"Testing images from: {TEST_IMAGES_DIR}")

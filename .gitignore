@@ -191,4 +191,5 @@ test_*.py
 !test_backend.py
 debug_liveness.py
 detailed_analysis.py
-/templates/
+templates/
+captures/

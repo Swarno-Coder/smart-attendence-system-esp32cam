@@ -20,14 +20,16 @@ from datetime import datetime
 # Backend client for face recognition
 from backend_client import FaceRecognitionClient, get_client, close_client
 
-# ============== FACE DETECTION CONFIG ==============
+# ============== YUNET FACE DETECTION CONFIG ==============
 FACE_DETECTION_ENABLED = True
-FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-MIN_FACE_SIZE = (30, 30)
-DETECTION_SCALE_FACTOR = 1.1
-MIN_NEIGHBORS = 3       # Reduced from 4 for better detection recall
-CAPTURE_STABILITY_FRAMES = 3  # Number of valid frames required before capture
+YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
+YUNET_SCORE_THRESHOLD = 0.6  # Confidence threshold for face detection
+YUNET_NMS_THRESHOLD = 0.3    # Non-maximum suppression threshold
+YUNET_TOP_K = 5              # Max faces to detect
+CAPTURE_STABILITY_FRAMES = 3  # Frames required for stable capture
 COOLDOWN_SECONDS = 3
+DETECTION_SKIP_FRAMES = 1    # Process every N frames for detection (1 = every frame)
+MIN_FACE_SIZE = 50           # Minimum face size in pixels
 
 # ============== BACKEND CONFIG ==============
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
@@ -35,26 +37,176 @@ BACKEND_ENABLED = True
 # =============================================
 
 # ============== FACE GUIDE CONFIG ==============
-# Guide oval settings (as percentage of frame dimensions after rotation)
 GUIDE_CENTER_X_PCT = 0.5    # Horizontal center
 GUIDE_CENTER_Y_PCT = 0.40   # Slightly above vertical center
 GUIDE_WIDTH_PCT = 0.55      # Oval width as % of frame width
 GUIDE_HEIGHT_PCT = 0.45     # Oval height as % of frame height
-# Relaxed tolerance - face just needs to be "around" the oval
-GUIDE_TOLERANCE = 0.5       # Face can be within 50% of guide boundary (Balanced)
-MIN_FACE_SIZE_IN_GUIDE = 0.25  # Smaller minimum for more flexibility
-MAX_FACE_SIZE_IN_GUIDE = 1.5   # Larger maximum for closer faces
-# Recognition timing
-RESULT_DISPLAY_SECONDS = 2  # How long to show result before resuming stream
-BACKEND_TIMEOUT_SECONDS = 10  # Timeout for backend response
+GUIDE_TOLERANCE = 0.5       # Face can be within 50% of guide boundary
+MIN_FACE_SIZE_IN_GUIDE = 0.25
+MAX_FACE_SIZE_IN_GUIDE = 1.5
+RESULT_DISPLAY_SECONDS = 2
+BACKEND_TIMEOUT_SECONDS = 10
+# Face cropping settings for backend
+FACE_CROP_MARGIN = 0.25     # 25% margin around face for cropping
+FACE_CROP_SIZE = (160, 160) # Size to resize cropped face
 # ===============================================
 
-face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
-if face_cascade.empty():
-    print("WARNING: Could not load face cascade classifier!")
-    FACE_DETECTION_ENABLED = False
+
+class YuNetFaceDetector:
+    """
+    OpenCV YuNet-based face detector - faster & more accurate than Haar cascade.
+    Especially performs better in low-light and varied angles.
+    """
+    
+    def __init__(self, model_path: str = YUNET_MODEL_PATH, input_size: tuple = (320, 240)):
+        self.model_path = model_path
+        self.input_size = input_size
+        self.detector = None
+        self.is_loaded = False
+        
+        try:
+            if not os.path.exists(model_path):
+                print(f"WARNING: YuNet model not found at {model_path}")
+                return
+            
+            self.detector = cv2.FaceDetectorYN.create(
+                model=model_path,
+                config="",
+                input_size=input_size,
+                score_threshold=YUNET_SCORE_THRESHOLD,
+                nms_threshold=YUNET_NMS_THRESHOLD,
+                top_k=YUNET_TOP_K,
+                backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
+                target_id=cv2.dnn.DNN_TARGET_CPU
+            )
+            self.is_loaded = True
+            print(f"YuNet face detector loaded: {input_size[0]}x{input_size[1]}")
+        except Exception as e:
+            print(f"ERROR loading YuNet: {e}")
+    
+    def set_input_size(self, width: int, height: int):
+        """Update input size for different frame resolutions."""
+        if self.detector and (width, height) != self.input_size:
+            self.input_size = (width, height)
+            self.detector.setInputSize(self.input_size)
+    
+    def detect(self, frame: np.ndarray) -> list:
+        """
+        Detect faces in frame.
+        
+        Returns:
+            List of dicts with: {
+                'bbox': (x, y, w, h),
+                'confidence': float,
+                'landmarks': [(x,y), ...] - 5 points: right_eye, left_eye, nose, right_mouth, left_mouth
+            }
+        """
+        if not self.is_loaded or frame is None:
+            return []
+        
+        h, w = frame.shape[:2]
+        self.set_input_size(w, h)
+        
+        # YuNet detection
+        _, faces = self.detector.detect(frame)
+        
+        if faces is None:
+            return []
+        
+        results = []
+        for face in faces:
+            # face: [x, y, w, h, x_re, y_re, x_le, y_le, x_n, y_n, x_rm, y_rm, x_lm, y_lm, confidence]
+            x, y, w, h = int(face[0]), int(face[1]), int(face[2]), int(face[3])
+            confidence = face[14]
+            
+            # Skip small faces
+            if w < MIN_FACE_SIZE or h < MIN_FACE_SIZE:
+                continue
+            
+            # Extract landmarks (5 points)
+            landmarks = [
+                (int(face[4]), int(face[5])),   # Right eye
+                (int(face[6]), int(face[7])),   # Left eye
+                (int(face[8]), int(face[9])),   # Nose tip
+                (int(face[10]), int(face[11])), # Right mouth corner
+                (int(face[12]), int(face[13])), # Left mouth corner
+            ]
+            
+            results.append({
+                'bbox': (x, y, w, h),
+                'confidence': confidence,
+                'landmarks': landmarks
+            })
+        
+        return results
+    
+    def crop_face(self, frame: np.ndarray, bbox: tuple, margin: float = FACE_CROP_MARGIN) -> np.ndarray:
+        """
+        Crop face region with margin for backend processing.
+        
+        Args:
+            frame: Original image
+            bbox: (x, y, w, h) face bounding box
+            margin: Percentage margin to add around face
+            
+        Returns:
+            Cropped and resized face image
+        """
+        x, y, w, h = bbox
+        img_h, img_w = frame.shape[:2]
+        
+        # Add margin
+        margin_w = int(w * margin)
+        margin_h = int(h * margin)
+        
+        x1 = max(0, x - margin_w)
+        y1 = max(0, y - margin_h)
+        x2 = min(img_w, x + w + margin_w)
+        y2 = min(img_h, y + h + margin_h)
+        
+        face_crop = frame[y1:y2, x1:x2]
+        
+        if face_crop.size == 0:
+            return None
+        
+        # Resize to standard size for backend
+        face_resized = cv2.resize(face_crop, FACE_CROP_SIZE, interpolation=cv2.INTER_LINEAR)
+        return face_resized
+    
+    def check_head_pose(self, landmarks: list) -> dict:
+        """
+        Check head pose using eye landmarks.
+        
+        Returns:
+            {'is_frontal': bool, 'tilt_angle': float}
+        """
+        if len(landmarks) < 2:
+            return {'is_frontal': False, 'tilt_angle': 0}
+        
+        right_eye = landmarks[0]
+        left_eye = landmarks[1]
+        
+        # Calculate eye angle (should be close to 0 for frontal face)
+        dx = left_eye[0] - right_eye[0]
+        dy = left_eye[1] - right_eye[1]
+        angle = np.degrees(np.arctan2(dy, dx))
+        
+        # Face is frontal if tilt is within ±15 degrees
+        is_frontal = abs(angle) < 15
+        
+        return {'is_frontal': is_frontal, 'tilt_angle': angle}
+
+
+# Initialize YuNet detector
+yunet_detector = YuNetFaceDetector()
+if not yunet_detector.is_loaded:
+    print("WARNING: YuNet not available, falling back to Haar cascade")
+    FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+    if face_cascade.empty():
+        FACE_DETECTION_ENABLED = False
 else:
-    print("Face cascade loaded successfully")
+    face_cascade = None
 
 lock = threading.Lock()
 connectedDevices = set()
@@ -89,27 +241,46 @@ class WSHandler(tornado.websocket.WebSocketHandler):
         self.state_change_time = 0
 
     def detect_faces(self, frame):
+        """
+        Detect faces using YuNet (preferred) or Haar cascade (fallback).
+        Returns list of face dicts with bbox, confidence, and landmarks.
+        """
         if not FACE_DETECTION_ENABLED or frame is None:
             return []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)  # Improvement: Contrast enhancement for low light
         
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=DETECTION_SCALE_FACTOR,
-            minNeighbors=MIN_NEIGHBORS,
-            minSize=MIN_FACE_SIZE,
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        return faces
+        # Use YuNet if available
+        if yunet_detector.is_loaded:
+            return yunet_detector.detect(frame)
+        
+        # Fallback to Haar cascade
+        if face_cascade is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=3,
+                minSize=(MIN_FACE_SIZE, MIN_FACE_SIZE),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            
+            # Convert Haar output to YuNet format
+            return [{'bbox': (x, y, w, h), 'confidence': 1.0, 'landmarks': []} 
+                    for (x, y, w, h) in faces]
+        
+        return []
 
     def process_frames(self, is_hq=False):
         if self.frame is None:
             return
         
         self.rawFrame = self.frame.copy()
-        # Face detection on original QVGA frame for performance
-        self.faces_detected = self.detect_faces(self.rawFrame)
+        # Face detection only for QVGA streaming frames (not HQ)
+        # HQ frames are for backend recognition - detection was done in QVGA already
+        # This prevents YuNet reshape errors when input size changes from QVGA to VGA
+        if not is_hq:
+            self.faces_detected = self.detect_faces(self.rawFrame)
         
         # Reset alignment flag for this frame processing cycle
         any_face_aligned = False
@@ -136,8 +307,13 @@ class WSHandler(tornado.websocket.WebSocketHandler):
         if len(self.faces_detected) > 0:
             frame_h_raw, frame_w_raw = self.rawFrame.shape[:2]
             
-            for (x, y, w, h) in self.faces_detected:
-                # Rotate coordinates logic
+            for face_info in self.faces_detected:
+                # Unpack face dict (YuNet format)
+                x, y, w, h = face_info['bbox']
+                confidence = face_info.get('confidence', 1.0)
+                landmarks = face_info.get('landmarks', [])
+                
+                # Rotate coordinates logic (camera is rotated 90 degrees)
                 new_x = frame_h_raw - y - h
                 new_y = x
                 new_w = h
@@ -162,44 +338,63 @@ class WSHandler(tornado.websocket.WebSocketHandler):
                 guide_ref_size = min(guide_width, guide_height)
                 size_ratio = face_size / guide_ref_size
                 
+                # Check head pose using landmarks (if available)
+                is_frontal = True
+                if landmarks and yunet_detector.is_loaded:
+                    pose_info = yunet_detector.check_head_pose(landmarks)
+                    is_frontal = pose_info['is_frontal']
+                
                 # Determine if face is aligned
                 position_ok = dx < GUIDE_TOLERANCE and dy < GUIDE_TOLERANCE
                 size_ok = MIN_FACE_SIZE_IN_GUIDE < size_ratio < MAX_FACE_SIZE_IN_GUIDE
                 
-                color = (0, 0, 255) # Default Red
+                color = (0, 0, 255)  # Default Red
                 
-                if position_ok:
-                    any_face_aligned = True # Mark as aligned for stability
-                    color = (0, 255, 0) # Green (Visual feedback immediate)
+                if position_ok and is_frontal:
+                    any_face_aligned = True
+                    color = (0, 255, 0)  # Green
                     
                     if self.stability_counter >= CAPTURE_STABILITY_FRAMES:
-                         face_alignment_status = "CAPTURING..."
+                        face_alignment_status = "CAPTURING..."
                     else:
-                         dots = "." * (self.stability_counter + 1)
-                         face_alignment_status = f"Hold still{dots}"
-                         
+                        dots = "." * (self.stability_counter + 1)
+                        face_alignment_status = f"Hold still{dots}"
+                        
+                elif not is_frontal:
+                    color = (0, 165, 255)  # Orange
+                    face_alignment_status = "Face the camera"
                 elif size_ratio < MIN_FACE_SIZE_IN_GUIDE:
                     color = (0, 255, 255)  # Yellow
                     face_alignment_status = "Move closer"
-                elif position_ok and not size_ok: 
-                     color = (0, 165, 255)  # Orange
-                     face_alignment_status = "Move back"
+                elif position_ok and not size_ok:
+                    color = (0, 165, 255)  # Orange
+                    face_alignment_status = "Move back"
                 else:
                     face_alignment_status = "Center your face"
                     
                 if is_hq:
                     color = (255, 0, 255)
                 
-                # Draw Box
+                # Draw face bounding box
                 disp_x = new_x * SCALE_FACTOR
                 disp_y = new_y * SCALE_FACTOR
                 disp_w = new_w * SCALE_FACTOR
                 disp_h = new_h * SCALE_FACTOR
                 
                 cv2.rectangle(display_frame, (disp_x, disp_y), (disp_x + disp_w, disp_y + disp_h), color, 2)
-                label = "HQ CAPTURE" if is_hq else ("ALIGNED" if any_face_aligned else "FACE")
+                
+                # Draw confidence and label
+                label = f"{confidence:.0%}" if is_hq else ("ALIGNED" if any_face_aligned else "FACE")
                 cv2.putText(display_frame, label, (disp_x, disp_y - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # Draw landmarks (rotate coordinates to match display)
+                if landmarks:
+                    for lm_x, lm_y in landmarks:
+                        # Rotate landmark coordinates
+                        rot_x = (frame_h_raw - lm_y) * SCALE_FACTOR
+                        rot_y = lm_x * SCALE_FACTOR
+                        cv2.circle(display_frame, (int(rot_x), int(rot_y)), 3, (255, 255, 0), -1)
 
         # Update stability counter
         if any_face_aligned:
@@ -289,9 +484,20 @@ class WSHandler(tornado.websocket.WebSocketHandler):
             return
         
         # Handle binary messages (frames)
-        self.frame = cv2.imdecode(np.frombuffer(message, dtype=np.uint8), cv2.IMREAD_COLOR)
+        # Validate minimum frame size (JPEG header at minimum is ~100 bytes)
+        if len(message) < 100:
+            print(f'[{self.id}] Received tiny frame ({len(message)} bytes) - skipping')
+            return
+        
+        # Attempt to decode JPEG - may fail on corrupt data
+        try:
+            self.frame = cv2.imdecode(np.frombuffer(message, dtype=np.uint8), cv2.IMREAD_COLOR)
+        except Exception as e:
+            print(f'[{self.id}] Frame decode exception: {e}')
+            return
+            
         if self.frame is None:
-            print('Failed to decode frame')
+            print(f'[{self.id}] Failed to decode frame ({len(message)} bytes) - corrupt JPEG')
             return
         
         frame_size = len(message)
@@ -309,13 +515,14 @@ class WSHandler(tornado.websocket.WebSocketHandler):
             self.awaiting_hq_frame = False
             
             # Send HQ frame to backend for recognition
+            # RESUME_STREAM is sent by backend completion handler or timeout
             if BACKEND_ENABLED and backend_client:
                 tornado.ioloop.IOLoop.current().add_callback(
                     self.send_to_backend, message
                 )
-            
-            # Send RESUME_STREAM command
-            tornado.ioloop.IOLoop.current().add_callback(self.send_resume_stream)
+            else:
+                # No backend configured - resume streaming immediately
+                tornado.ioloop.IOLoop.current().add_callback(self.send_resume_stream)
         else:
             # Normal QVGA streaming frame - process synchronously for reliable face detection
             self.frame_count = getattr(self, 'frame_count', 0) + 1
@@ -338,17 +545,24 @@ class WSHandler(tornado.websocket.WebSocketHandler):
                     print(f"[{self.id}] Face aligned in guide! Sending CAPTURE_HQ")
     
     def send_resume_stream(self):
-        """Send RESUME_STREAM command after a brief delay"""
+        """Send RESUME_STREAM command - only if connection is open"""
         try:
+            # Check if WebSocket connection is still open
+            if self.ws_connection is None:
+                print(f"[{self.id}] Cannot send RESUME_STREAM - connection closed")
+                self.stream_paused = False  # Reset state anyway
+                return
             self.write_message("RESUME_STREAM")
             self.stream_paused = False
             print(f"Sent RESUME_STREAM to {self.id}")
         except Exception as e:
             print(f"Error sending RESUME_STREAM: {e}")
+            self.stream_paused = False  # Reset state on error
     
     async def send_to_backend(self, image_bytes: bytes):
         """
         Send HQ image to backend for face recognition.
+        Saves the HQ image to disk and sends the FULL image (no cropping).
         Manages recognition state and handles timeout.
         """
         global backend_client
@@ -367,13 +581,40 @@ class WSHandler(tornado.websocket.WebSocketHandler):
         self.state_change_time = time.time()
         
         try:
-            print(f"[{self.id}] Sending {len(image_bytes)} bytes to backend...")
+            # === SAVE HQ IMAGE TO DISK ===
+            captures_dir = os.path.join(os.path.dirname(__file__), "captures")
+            os.makedirs(captures_dir, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{self.id}_{timestamp}.jpg"
+            filepath = os.path.join(captures_dir, filename)
+            
+            with open(filepath, 'wb') as f:
+                f.write(image_bytes)
+            print(f"[{self.id}] Saved HQ image: {filepath} ({len(image_bytes)} bytes)")
+            
+            # === SEND FULL IMAGE TO BACKEND (NO CROPPING) ===
+            # Cropping is disabled to ensure backend receives full context for recognition
+            bytes_to_send = image_bytes
+            
+            # OLD CROPPING CODE (DISABLED):
+            # hq_frame = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+            # if hq_frame is not None and yunet_detector.is_loaded:
+            #     faces = yunet_detector.detect(hq_frame)
+            #     if faces:
+            #         largest_face = max(faces, key=lambda f: f['bbox'][2] * f['bbox'][3])
+            #         cropped_face = yunet_detector.crop_face(hq_frame, largest_face['bbox'])
+            #         if cropped_face is not None:
+            #             _, encoded = cv2.imencode('.jpg', cropped_face, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            #             bytes_to_send = encoded.tobytes()
+            
+            print(f"[{self.id}] Sending FULL {len(bytes_to_send)} bytes to backend...")
             
             # Add timeout to backend call
             import asyncio
             try:
                 result = await asyncio.wait_for(
-                    backend_client.recognize_face(image_bytes),
+                    backend_client.recognize_face(bytes_to_send),
                     timeout=BACKEND_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
@@ -465,6 +706,10 @@ class WSHandler(tornado.websocket.WebSocketHandler):
         self.recognition_result = None
         self.recognition_person_name = ''
         self.recognition_message = ''
+        # Check if connection is still open before sending
+        if self.ws_connection is None:
+            print(f"[{self.id}] Connection already closed - skipping RESUME_STREAM")
+            return
         self.send_resume_stream()
 
     def on_close(self):

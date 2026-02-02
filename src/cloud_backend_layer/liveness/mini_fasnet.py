@@ -302,7 +302,10 @@ class EnhancedLivenessDetector:
     
     def predict(self, face_image: np.ndarray) -> Tuple[bool, float]:
         """
-        Multi-factor liveness prediction.
+        Liveness prediction using MiniFASNetV2 only.
+        
+        NOTE: Advanced print detection and reflection analysis are commented out
+        for now to verify recognition works. Uncomment later for full anti-spoofing.
         
         Returns:
             (is_live, confidence)
@@ -310,31 +313,43 @@ class EnhancedLivenessDetector:
         if face_image is None or face_image.size == 0:
             return False, 0.0
         
-        # Get individual scores
+        # Get MiniFASNet deep learning score
         minifas_score = self._predict_minifas(face_image)
-        print_score, _ = self.print_detector.analyze(face_image)
-        reflection_score, _ = self.reflection_analyzer.analyze(face_image)
         
-        # Weighted fusion
-        final_score = (
-            self.weights["minifas"] * minifas_score +
-            self.weights["print"] * print_score +
-            self.weights["reflection"] * reflection_score
-        )
+        # ========== ADVANCED LIVENESS CHECKS (COMMENTED FOR DEBUGGING) ==========
+        # TODO: Uncomment these for full anti-spoofing after recognition is verified
+        #
+        # print_score, _ = self.print_detector.analyze(face_image)
+        # reflection_score, _ = self.reflection_analyzer.analyze(face_image)
+        # 
+        # # Weighted fusion
+        # final_score = (
+        #     self.weights["minifas"] * minifas_score +
+        #     self.weights["print"] * print_score +
+        #     self.weights["reflection"] * reflection_score
+        # )
+        # 
+        # # VETO LOGIC: If print detector confidently identifies a print, reject
+        # # Print score < 0.6 indicates strong print characteristics
+        # if print_score < 0.6:
+        #     is_live = False
+        #     confidence = 0.5 + (0.6 - print_score)  # Higher confidence for lower print scores
+        #     confidence = min(1.0, confidence)
+        # else:
+        #     is_live = final_score > self.threshold
+        #     confidence = 0.5 + abs(final_score - self.threshold)
+        #     confidence = min(1.0, confidence)
+        # 
+        # logger.debug(f"Liveness: minifas={minifas_score:.2f}, print={print_score:.2f}, "
+        #             f"reflection={reflection_score:.2f}, final={final_score:.2f}")
+        # =========================================================================
         
-        # VETO LOGIC: If print detector confidently identifies a print, reject
-        # Print score < 0.6 indicates strong print characteristics
-        if print_score < 0.6:
-            is_live = False
-            confidence = 0.5 + (0.6 - print_score)  # Higher confidence for lower print scores
-            confidence = min(1.0, confidence)
-        else:
-            is_live = final_score > self.threshold
-            confidence = 0.5 + abs(final_score - self.threshold)
-            confidence = min(1.0, confidence)
+        # Simple MiniFASNet-only liveness check
+        # Score > 0.5 means the model thinks it's a real face
+        is_live = minifas_score > 0.5
+        confidence = minifas_score
         
-        logger.debug(f"Liveness: minifas={minifas_score:.2f}, print={print_score:.2f}, "
-                    f"reflection={reflection_score:.2f}, final={final_score:.2f}")
+        logger.debug(f"Liveness (MiniFASNet only): score={minifas_score:.2f}")
         
         return is_live, confidence
 
