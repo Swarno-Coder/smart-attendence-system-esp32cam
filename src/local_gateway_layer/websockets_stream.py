@@ -25,9 +25,9 @@ FACE_DETECTION_ENABLED = True
 YUNET_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "face_detection_yunet_2023mar.onnx")
 YUNET_SCORE_THRESHOLD = 0.6  # Confidence threshold for face detection
 YUNET_NMS_THRESHOLD = 0.3    # Non-maximum suppression threshold
-YUNET_TOP_K = 5              # Max faces to detect
-CAPTURE_STABILITY_FRAMES = 3  # Frames required for stable capture
-COOLDOWN_SECONDS = 3
+YUNET_TOP_K = 3              # Max faces to detect
+CAPTURE_STABILITY_FRAMES = 2  # Frames required for stable capture
+COOLDOWN_SECONDS = 2
 DETECTION_SKIP_FRAMES = 1    # Process every N frames for detection (1 = every frame)
 MIN_FACE_SIZE = 50           # Minimum face size in pixels
 
@@ -319,58 +319,40 @@ class WSHandler(tornado.websocket.WebSocketHandler):
                 new_w = h
                 new_h = w
                 
-                # Calculate face center relative to guide
+                # === RELAXED ALIGNMENT CHECK ===
+                # Just check if face is roughly in frame and big enough
                 face_center_x = new_x + new_w // 2
                 face_center_y = new_y + new_h // 2
-                
-                # Check alignment with upscaled guide coordinates
                 face_center_x_up = face_center_x * SCALE_FACTOR
                 face_center_y_up = face_center_y * SCALE_FACTOR
-                face_w_up = new_w * SCALE_FACTOR
-                face_h_up = new_h * SCALE_FACTOR
                 
-                # Deviation from guide center (normalized by guide semi-axes)
-                dx = abs(face_center_x_up - guide_center_x) / (guide_width / 2)
-                dy = abs(face_center_y_up - guide_center_y) / (guide_height / 2)
+                # Check if face is in the general area (very relaxed - within 80% of frame)
+                in_frame_x = 0.1 * display_w < face_center_x_up < 0.9 * display_w
+                in_frame_y = 0.1 * display_h < face_center_y_up < 0.9 * display_h
+                position_ok = in_frame_x and in_frame_y
                 
-                # Check if face size is appropriate
+                # Check minimum face size (face should be at least 15% of frame width)
                 face_size = max(new_w, new_h) * SCALE_FACTOR
-                guide_ref_size = min(guide_width, guide_height)
-                size_ratio = face_size / guide_ref_size
-                
-                # Check head pose using landmarks (if available)
-                is_frontal = True
-                if landmarks and yunet_detector.is_loaded:
-                    pose_info = yunet_detector.check_head_pose(landmarks)
-                    is_frontal = pose_info['is_frontal']
-                
-                # Determine if face is aligned
-                position_ok = dx < GUIDE_TOLERANCE and dy < GUIDE_TOLERANCE
-                size_ok = MIN_FACE_SIZE_IN_GUIDE < size_ratio < MAX_FACE_SIZE_IN_GUIDE
+                min_size = display_w * 0.15  # 15% of frame width
+                size_ok = face_size >= min_size
                 
                 color = (0, 0, 255)  # Default Red
                 
-                if position_ok and is_frontal:
+                if position_ok and size_ok:
                     any_face_aligned = True
                     color = (0, 255, 0)  # Green
                     
                     if self.stability_counter >= CAPTURE_STABILITY_FRAMES:
                         face_alignment_status = "CAPTURING..."
                     else:
-                        dots = "." * (self.stability_counter + 1)
-                        face_alignment_status = f"Hold still{dots}"
+                        face_alignment_status = "Hold steady..."
                         
-                elif not is_frontal:
-                    color = (0, 165, 255)  # Orange
-                    face_alignment_status = "Face the camera"
-                elif size_ratio < MIN_FACE_SIZE_IN_GUIDE:
+                elif not size_ok:
                     color = (0, 255, 255)  # Yellow
                     face_alignment_status = "Move closer"
-                elif position_ok and not size_ok:
-                    color = (0, 165, 255)  # Orange
-                    face_alignment_status = "Move back"
                 else:
-                    face_alignment_status = "Center your face"
+                    color = (0, 165, 255)  # Orange
+                    face_alignment_status = "Look at camera"
                     
                 if is_hq:
                     color = (255, 0, 255)
@@ -383,24 +365,23 @@ class WSHandler(tornado.websocket.WebSocketHandler):
                 
                 cv2.rectangle(display_frame, (disp_x, disp_y), (disp_x + disp_w, disp_y + disp_h), color, 2)
                 
-                # Draw confidence and label
-                label = f"{confidence:.0%}" if is_hq else ("ALIGNED" if any_face_aligned else "FACE")
+                # Draw confidence label
+                label = f"{confidence:.0%}"
                 cv2.putText(display_frame, label, (disp_x, disp_y - 10), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
                 # Draw landmarks (rotate coordinates to match display)
                 if landmarks:
                     for lm_x, lm_y in landmarks:
-                        # Rotate landmark coordinates
                         rot_x = (frame_h_raw - lm_y) * SCALE_FACTOR
                         rot_y = lm_x * SCALE_FACTOR
                         cv2.circle(display_frame, (int(rot_x), int(rot_y)), 3, (255, 255, 0), -1)
 
-        # Update stability counter
+        # Update stability counter - increment if face is aligned
         if any_face_aligned:
              self.stability_counter = min(self.stability_counter + 1, CAPTURE_STABILITY_FRAMES + 1)
         else:
-             self.stability_counter = 0 # Reset if alignment lost
+             self.stability_counter = 0 # Reset if not aligned
              
         # Set trigger flag only if stable
         self.face_in_guide = (self.stability_counter >= CAPTURE_STABILITY_FRAMES)

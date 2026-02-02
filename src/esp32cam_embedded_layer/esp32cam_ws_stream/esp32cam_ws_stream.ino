@@ -26,11 +26,12 @@
 #define VSYNC_GPIO_NUM 25
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
-
+#define WIFI_UNAME "SWARNO"
+#define WIFI_PASS "snag@1733"
 // ============== OPTIMIZED SETTINGS ==============
 #define STREAM_FRAMESIZE FRAMESIZE_QVGA // 320x240
 #define STREAM_QUALITY                                                         \
-  20 // Lower quality (higher number) = smaller packet size, preventing "Corrupt
+  30 // Lower quality (higher number) = smaller packet size, preventing "Corrupt
      // JPEG"
 #define CAPTURE_FRAMESIZE FRAMESIZE_VGA // 640x480
 #define CAPTURE_QUALITY 10              // Good balance for recognition
@@ -97,16 +98,18 @@ esp_err_t init_camera() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_VGA;
+    config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = STREAM_QUALITY;
     config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
     Serial.println("PSRAM found - dual buffer mode");
   } else {
-    config.frame_size = FRAMESIZE_QVGA;
+    config.frame_size = FRAMESIZE_QQVGA;
     config.jpeg_quality = STREAM_QUALITY;
     config.fb_count = 1;
     Serial.println("No PSRAM - single buffer mode");
@@ -119,15 +122,15 @@ esp_err_t init_camera() {
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  s->set_framesize(s, STREAM_FRAMESIZE);
-  s->set_quality(s, STREAM_QUALITY);
+  // s->set_framesize(s, STREAM_FRAMESIZE);
+  // s->set_quality(s, STREAM_QUALITY);
 
   Serial.println("Camera initialized in STREAMING mode (QVGA 320x240)");
   return ESP_OK;
 };
 
 esp_err_t init_wifi() {
-  WiFi.begin("SWARNO", "snag@1733");
+  WiFi.begin(WIFI_UNAME, WIFI_PASS);
   Serial.println("Starting Wifi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -204,30 +207,32 @@ void loop() {
   }
 
   case STATE_PAUSED: {
-    // Switch camera to VGA mode
-    Serial.println("Switching to VGA mode...");
+    // === SIMPLIFIED: Just change quality, keep QVGA resolution ===
+    Serial.println("Switching to HQ quality...");
     sensor_t *s = esp_camera_sensor_get();
-    s->set_framesize(s, CAPTURE_FRAMESIZE);
-    s->set_quality(s, CAPTURE_QUALITY);
-    delay(150); // Allow sensor to stabilize
+    // OLD VGA CODE (commented for future use):
+    // s->set_framesize(s, CAPTURE_FRAMESIZE);
+    s->set_quality(s, 8); // High quality JPEG (lower = better)
+    delay(100);           // Allow sensor to stabilize
     currentState = STATE_CAPTURING;
     break;
   }
 
   case STATE_CAPTURING: {
-    // Capture and send VGA frame
+    // Capture and send HQ frame (same QVGA resolution, better quality)
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) {
       // Send marker before HQ frame so server knows it's HQ
       client.send("HQ_FRAME_START");
       client.sendBinary((const char *)fb->buf, fb->len);
-      Serial.printf("HQ frame sent: %d bytes (VGA)\n", fb->len);
+      Serial.printf("HQ frame sent: %d bytes (QVGA HQ)\n", fb->len);
       esp_camera_fb_return(fb);
     }
 
-    // Switch back to QVGA but don't stream yet
+    // Switch back to streaming quality
     sensor_t *s = esp_camera_sensor_get();
-    s->set_framesize(s, STREAM_FRAMESIZE);
+    // OLD VGA CODE (commented for future use):
+    // s->set_framesize(s, STREAM_FRAMESIZE);
     s->set_quality(s, STREAM_QUALITY);
 
     currentState = STATE_WAITING;
