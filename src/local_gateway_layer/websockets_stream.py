@@ -822,75 +822,188 @@ class CapturesViewHandler(tornado.web.RequestHandler):
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Smart Attendance System</title>
+    <title>Smart Distributed Attendance System</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #1a1a2e;
-            --card-bg: rgba(22, 33, 62, 0.9);
+            --bg-color: #0a0a1a;
+            --card-bg: rgba(255, 255, 255, 0.05);
+            --glass-bg: rgba(255, 255, 255, 0.08);
+            --glass-border: rgba(255, 255, 255, 0.15);
             --primary: #00d4ff;
+            --primary-glow: rgba(0, 212, 255, 0.3);
             --success: #00ff88;
+            --success-glow: rgba(0, 255, 136, 0.3);
             --error: #ff3366;
+            --error-glow: rgba(255, 51, 102, 0.3);
             --text-main: #ffffff;
             --text-sub: #8892b0;
         }
 
-        body {
-            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-            color: var(--text-main);
+        * {
             margin: 0;
             padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(-45deg, #0a0a1a, #1a1a3e, #0f1a2a, #1a0a2a, #0a0a1a);
+            background-size: 400% 400%;
+            animation: gradientFlow 12s ease infinite;
+            color: var(--text-main);
             min-height: 100vh;
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
             overflow: hidden;
             transition: background 0.5s ease;
+            position: relative;
         }
 
-        /* Dynamic Theme Classes */
-        body.theme-success {
-            background: linear-gradient(135deg, #051c10, #0c3a23, #022010);
+        @keyframes gradientFlow {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
         }
+
+        /* Animated background orbs */
+        body::before, body::after {
+            content: '';
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(100px);
+            z-index: 0;
+            opacity: 0.4;
+            transition: opacity 0.5s ease;
+        }
+        body::before {
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, rgba(0,212,255,0.3), transparent 70%);
+            top: -200px;
+            left: -200px;
+            animation: float1 15s ease-in-out infinite;
+        }
+        body::after {
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(138,43,226,0.25), transparent 70%);
+            bottom: -150px;
+            right: -150px;
+            animation: float2 20s ease-in-out infinite;
+        }
+
+        @keyframes float1 {
+            0%, 100% { transform: translate(0, 0); }
+            50% { transform: translate(50px, 50px); }
+        }
+        @keyframes float2 {
+            0%, 100% { transform: translate(0, 0); }
+            50% { transform: translate(-30px, -30px); }
+        }
+
+        /* Dynamic Theme Classes - Pause gradient animation and set solid theme */
+        body.theme-success {
+            background: linear-gradient(135deg, #051c10 0%, #0c3a23 50%, #022010 100%);
+            animation: none;
+        }
+        body.theme-success::before {
+            background: radial-gradient(circle, rgba(0,255,136,0.3), transparent 70%);
+            opacity: 0.6;
+        }
+        body.theme-success::after {
+            background: radial-gradient(circle, rgba(0,200,100,0.2), transparent 70%);
+        }
+
         body.theme-error {
-            background: linear-gradient(135deg, #2a0a10, #4a1218, #200508);
+            background: linear-gradient(135deg, #1a0a10 0%, #2a1218 50%, #150508 100%);
+            animation: none;
+        }
+        body.theme-error::before {
+            background: radial-gradient(circle, rgba(255,51,102,0.3), transparent 70%);
+            opacity: 0.6;
+        }
+        body.theme-error::after {
+            background: radial-gradient(circle, rgba(200,50,80,0.2), transparent 70%);
+        }
+
+        /* Main Title */
+        .main-title {
+            position: relative;
+            z-index: 10;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .main-title h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            background: linear-gradient(135deg, #00d4ff 0%, #a855f7 50%, #00d4ff 100%);
+            background-size: 200% auto;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: shimmer 3s linear infinite;
+            text-shadow: 0 0 40px rgba(0,212,255,0.3);
+        }
+        @keyframes shimmer {
+            0% { background-position: 0% center; }
+            100% { background-position: 200% center; }
+        }
+        .main-title .subtitle {
+            font-size: 0.9rem;
+            color: var(--text-sub);
+            letter-spacing: 2px;
+            margin-top: 8px;
+            font-weight: 400;
         }
 
         .dashboard {
+            position: relative;
+            z-index: 10;
             display: grid;
             grid-template-columns: 2fr 1fr;
             gap: 30px;
             width: 90%;
             max-width: 1200px;
-            height: 85vh;
+            height: 75vh;
         }
 
+        /* Glassmorphism Video Section */
         .video-section {
-            background: var(--card-bg);
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
             border-radius: 24px;
             overflow: hidden;
             position: relative;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
-            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 
+                0 8px 32px rgba(0, 0, 0, 0.4),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--glass-border);
             display: flex;
             flex-direction: column;
         }
 
         .header {
             padding: 20px 30px;
-            background: rgba(0,0,0,0.2);
+            background: rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
+            border-bottom: 1px solid rgba(255,255,255,0.08);
         }
 
         .header h1 {
             margin: 0;
-            font-size: 1.5rem;
+            font-size: 1.3rem;
             font-weight: 600;
-            letter-spacing: 1px;
+            letter-spacing: 2px;
             color: var(--primary);
         }
         
@@ -901,10 +1014,11 @@ class CapturesViewHandler(tornado.web.RequestHandler):
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: var(--text-sub);
             font-weight: 600;
             text-transform: uppercase;
+            letter-spacing: 1px;
         }
 
         .dot {
@@ -917,7 +1031,7 @@ class CapturesViewHandler(tornado.web.RequestHandler):
         
         .active .dot {
             background-color: var(--success);
-            box-shadow: 0 0 10px var(--success);
+            box-shadow: 0 0 15px var(--success);
             animation: pulse 2s infinite;
         }
 
@@ -927,7 +1041,7 @@ class CapturesViewHandler(tornado.web.RequestHandler):
             display: flex;
             align-items: center;
             justify-content: center;
-            background: #000;
+            background: rgba(0, 0, 0, 0.4);
             overflow: hidden;
         }
 
@@ -948,8 +1062,11 @@ class CapturesViewHandler(tornado.web.RequestHandler):
         .show-capture #video-feed { opacity: 0; z-index: 1; }
         .show-capture #captured-image { opacity: 1; z-index: 2; }
 
+        /* Glassmorphism Status Panel */
         .status-panel {
-            background: var(--card-bg);
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
             border-radius: 24px;
             padding: 40px;
             display: flex;
@@ -957,13 +1074,23 @@ class CapturesViewHandler(tornado.web.RequestHandler):
             align-items: center;
             justify-content: center;
             text-align: center;
-            border: 1px solid rgba(255,255,255,0.1);
-            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            border: 1px solid var(--glass-border);
+            box-shadow: 
+                0 8px 32px rgba(0, 0, 0, 0.4),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
             transition: all 0.3s ease;
         }
         
-        .theme-success .status-panel { border-color: rgba(0, 255, 136, 0.3); background: rgba(0, 50, 25, 0.8); }
-        .theme-error .status-panel { border-color: rgba(255, 51, 102, 0.3); background: rgba(50, 10, 20, 0.8); }
+        .theme-success .status-panel { 
+            border-color: rgba(0, 255, 136, 0.3); 
+            background: rgba(0, 50, 25, 0.5);
+            box-shadow: 0 0 60px rgba(0, 255, 136, 0.15);
+        }
+        .theme-error .status-panel { 
+            border-color: rgba(255, 51, 102, 0.3); 
+            background: rgba(50, 10, 20, 0.5);
+            box-shadow: 0 0 60px rgba(255, 51, 102, 0.15);
+        }
 
         /* Status Animations */
         .loader {
@@ -988,7 +1115,7 @@ class CapturesViewHandler(tornado.web.RequestHandler):
             height: 80%;
             top: 10%;
             left: 10%;
-            border-top-color: #ff00ff;
+            border-top-color: #a855f7;
             animation: spin 1.5s linear infinite reverse;
         }
 
@@ -1002,19 +1129,20 @@ class CapturesViewHandler(tornado.web.RequestHandler):
         .error-icon { color: var(--error); }
 
         .status-text {
-            font-size: 1.2rem;
+            font-size: 1.1rem;
             color: var(--text-sub);
             margin-bottom: 10px;
             text-transform: uppercase;
-            letter-spacing: 2px;
+            letter-spacing: 3px;
+            font-weight: 500;
         }
 
         .result-text {
-            font-size: 2.5rem;
+            font-size: 2.2rem;
             font-weight: 700;
             color: var(--text-main);
             margin: 0;
-            text-shadow: 0 0 20px rgba(0,0,0,0.5);
+            text-shadow: 0 0 30px rgba(255,255,255,0.2);
         }
 
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -1029,35 +1157,65 @@ class CapturesViewHandler(tornado.web.RequestHandler):
         .state-processing .icon-box { display: none; }
         
         .state-success .loader { display: none; }
-        .state-success .icon-box.success-icon { display: block; filter: drop-shadow(0 0 20px var(--success)); }
+        .state-success .icon-box.success-icon { display: block; filter: drop-shadow(0 0 30px var(--success)); }
         
         .state-error .loader { display: none; }
-        .state-error .icon-box.error-icon { display: block; filter: drop-shadow(0 0 20px var(--error)); }
+        .state-error .icon-box.error-icon { display: block; filter: drop-shadow(0 0 30px var(--error)); }
         
-        /* Guide text overlay */
+        /* Guide text overlay - Glassmorphism */
         .guide-overlay {
             position: absolute;
             bottom: 30px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(0,0,0,0.6);
-            padding: 10px 20px;
-            border-radius: 20px;
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(10px);
+            padding: 12px 24px;
+            border-radius: 30px;
             color: #fff;
-            font-size: 1.1rem;
+            font-size: 1rem;
             z-index: 10;
-            border: 1px solid rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.15);
             pointer-events: none;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }
+
+        /* Footer */
+        .footer {
+            position: fixed;
+            bottom: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 100;
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.5);
+            letter-spacing: 1px;
+            text-align: center;
+        }
+        .footer .heart {
+            color: #ff3366;
+            animation: heartbeat 1.5s ease-in-out infinite;
+        }
+        @keyframes heartbeat {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.2); }
         }
 
     </style>
 </head>
 <body class="theme-default">
+    <!-- Main Title -->
+    <div class="main-title">
+        <h1>Smart Distributed Attendance System</h1>
+        <div class="subtitle">Face Recognition Powered by AI</div>
+    </div>
+
     <div class="dashboard">
         <!-- Video Section -->
         <div class="video-section">
             <div class="header">
-                <h1>SMART ATTENDANCE</h1>
+                <h1>LIVE CAMERA</h1>
                 <div class="live-indicator active">
                     <div class="dot"></div>
                     <span id="conn-status">LIVE SYSTEM</span>
@@ -1088,6 +1246,11 @@ class CapturesViewHandler(tornado.web.RequestHandler):
             <div class="status-text" id="status-label">SYSTEM READY</div>
             <h2 class="result-text" id="result-label">Waiting...</h2>
         </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+        Made by CU MCA students with <span class="heart">❤</span>
     </div>
 
     <script>
