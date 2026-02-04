@@ -1,0 +1,10 @@
+# SQLite databases
+*.sqlite3
+*.sqlite
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# SQLAlchemy / Flask-SQLAlchemy instance folder
+instance/

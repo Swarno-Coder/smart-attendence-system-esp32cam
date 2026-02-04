@@ -21,7 +21,21 @@ import cv2
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Import attendance database module
+# Add current directory to path to ensure database module is found
+import sys
+_current_dir = Path(__file__).parent
+if str(_current_dir) not in sys.path:
+    sys.path.insert(0, str(_current_dir))
+
+try:
+    from database import get_db_manager, AttendanceService
+    DATABASE_AVAILABLE = True
+except ImportError as e:
+    DATABASE_AVAILABLE = False
+    print(f"Warning: Database module not available: {e}")
 
 # Configure logging
 logging.basicConfig(
@@ -109,11 +123,23 @@ class FaceMatch(BaseModel):
     matched: bool
 
 
+class AttendanceInfo(BaseModel):
+    """Attendance logging result."""
+    event_type: str = Field(..., description="ENTRY, EXIT, DUPLICATE, or INVALID")
+    status: str = Field(..., description="SUCCESS, REJECTED, ALREADY_LOGGED, or ERROR")
+    message: str = Field(..., description="Human-readable status message")
+    daily_summary: Optional[Dict[str, Any]] = Field(None, description="Today's attendance summary")
+    cooldown_remaining_seconds: Optional[int] = Field(None, description="Seconds until next scan allowed")
+    is_anomaly: bool = Field(False, description="Whether this was flagged as anomalous")
+    anomaly_reason: Optional[str] = Field(None, description="Reason for anomaly flag")
+
+
 class RecognitionResponse(BaseModel):
     success: bool
     liveness: LivenessResult
     face_detected: bool
     face_match: Optional[FaceMatch] = None
+    attendance: Optional[AttendanceInfo] = None
     processing_time_ms: float
     timestamp: str
     message: str
@@ -123,6 +149,7 @@ class RecognitionResponse(BaseModel):
 liveness_detector = None
 face_analyzer = None
 known_embeddings: Dict[str, Dict[str, Any]] = {}
+attendance_service: Optional['AttendanceService'] = None  # SQLite attendance tracking
 
 
 def load_liveness_model():
@@ -385,7 +412,9 @@ def detect_and_recognize_face(image: np.ndarray) -> tuple:
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize models on startup."""
+    """Initialize models and database on startup."""
+    global attendance_service
+    
     logger.info("=" * 60)
     logger.info("Starting Face Recognition Backend")
     logger.info("=" * 60)
@@ -399,10 +428,30 @@ async def startup_event():
     face_rec_loaded = load_face_recognition_model()
     num_embeddings = load_known_embeddings()
     
+    # Initialize attendance database
+    db_initialized = False
+    if DATABASE_AVAILABLE:
+        try:
+            db_manager = get_db_manager()
+            attendance_service = AttendanceService(db_manager)
+            
+            # Sync persons from existing embeddings
+            synced = db_manager.sync_persons_from_embeddings(EMBEDDINGS_DIR)
+            
+            db_stats = db_manager.get_stats()
+            db_initialized = True
+            logger.info(f"Database: ✓ Initialized ({db_stats['total_persons']} persons, {db_stats['total_logs']} logs)")
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            attendance_service = None
+    else:
+        logger.warning("Database: ✗ Module not available - attendance tracking disabled")
+    
     logger.info("-" * 60)
     logger.info(f"Liveness Model: {'✓ Loaded' if liveness_loaded else '✗ Not Available'}")
     logger.info(f"Face Recognition: {'✓ Loaded' if face_rec_loaded else '✗ Not Available'}")
     logger.info(f"Known Faces: {num_embeddings}")
+    logger.info(f"Attendance DB: {'✓ Ready' if db_initialized else '✗ Disabled'}")
     logger.info("=" * 60)
 
 
@@ -414,7 +463,8 @@ async def root():
         "service": "Smart Attendance Face Recognition API",
         "liveness_model": liveness_detector is not None,
         "face_recognition_model": face_analyzer is not None,
-        "known_faces_count": len(known_embeddings)
+        "known_faces_count": len(known_embeddings),
+        "attendance_database": attendance_service is not None
     }
 
 
@@ -484,16 +534,67 @@ async def recognize_face(image: UploadFile = File(...)):
         
         if face_match and face_match.matched:
             logger.info(f"Face matched: {face_match.person_name} ({face_match.similarity:.2f})")
+            
+            # Step 4: Log attendance if database available
+            attendance_info = None
+            if attendance_service:
+                try:
+                    # Encode image for potential storage (failed/anomaly cases)
+                    _, img_encoded = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    face_image_bytes = img_encoded.tobytes()
+                    
+                    attendance_result = attendance_service.log_attendance(
+                        person_id=face_match.person_id,
+                        person_name=face_match.person_name,
+                        confidence=face_match.similarity,
+                        liveness_score=liveness_result.confidence,
+                        device_id="esp32cam",
+                        face_image=face_image_bytes
+                    )
+                    
+                    attendance_info = AttendanceInfo(
+                        event_type=attendance_result.event_type,
+                        status=attendance_result.status,
+                        message=attendance_result.message,
+                        daily_summary=attendance_result.daily_summary,
+                        cooldown_remaining_seconds=attendance_result.cooldown_remaining,
+                        is_anomaly=attendance_result.is_anomaly,
+                        anomaly_reason=attendance_result.anomaly_reason
+                    )
+                    logger.info(f"Attendance logged: {attendance_result.event_type} - {attendance_result.message}")
+                except Exception as e:
+                    logger.error(f"Attendance logging failed: {e}")
+                    attendance_info = AttendanceInfo(
+                        event_type="ERROR",
+                        status="ERROR",
+                        message=f"Attendance logging error: {str(e)}"
+                    )
+            
             return RecognitionResponse(
                 success=True,
                 liveness=liveness_result,
                 face_detected=True,
                 face_match=face_match,
+                attendance=attendance_info,
                 processing_time_ms=processing_time,
                 timestamp=datetime.now().isoformat(),
                 message=f"Face recognized: {face_match.person_name}"
             )
         else:
+            # Log failed recognition attempt
+            if attendance_service:
+                try:
+                    _, img_encoded = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    attendance_service.log_failed_recognition(
+                        reason="Face not recognized - no matching person found",
+                        confidence=face_match.similarity if face_match else None,
+                        liveness_score=liveness_result.confidence,
+                        device_id="esp32cam",
+                        face_image=img_encoded.tobytes()
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to log unrecognized attempt: {e}")
+            
             return RecognitionResponse(
                 success=False,
                 liveness=liveness_result,
@@ -559,6 +660,13 @@ async def register_face(
             'embedding': embedding_norm
         }
         
+        # Add person to attendance database
+        if attendance_service:
+            try:
+                attendance_service.ensure_person_exists(person_id, person_name)
+            except Exception as e:
+                logger.warning(f"Failed to add person to attendance DB: {e}")
+        
         logger.info(f"Registered face for: {person_name} ({person_id})")
         
         return {
@@ -603,6 +711,87 @@ async def delete_face(person_id: str):
     
     logger.info(f"Deleted face: {person_id}")
     return {"success": True, "message": f"Face deleted: {person_id}"}
+
+
+# ============== Attendance Endpoints ==============
+
+@app.get("/attendance/today")
+async def get_today_attendance(person_id: Optional[str] = Query(None, description="Filter by person ID")):
+    """Get today's attendance logs."""
+    if not attendance_service:
+        raise HTTPException(status_code=503, detail="Attendance database not available")
+    
+    try:
+        logs = attendance_service.get_today_logs(person_id=person_id)
+        return {
+            "success": True,
+            "date": datetime.now().date().isoformat(),
+            "logs": logs,
+            "count": len(logs)
+        }
+    except Exception as e:
+        logger.error(f"Error getting today's attendance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/attendance/daily-report")
+async def get_daily_report(date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format")):
+    """Get daily attendance report with summary."""
+    if not attendance_service:
+        raise HTTPException(status_code=503, detail="Attendance database not available")
+    
+    try:
+        from datetime import date as date_type
+        report_date = None
+        if date:
+            report_date = date_type.fromisoformat(date)
+        
+        report = attendance_service.get_daily_report(report_date)
+        return {"success": True, "report": report}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    except Exception as e:
+        logger.error(f"Error getting daily report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/attendance/person/{person_id}")
+async def get_person_attendance(person_id: str):
+    """Get today's attendance summary for a specific person."""
+    if not attendance_service:
+        raise HTTPException(status_code=503, detail="Attendance database not available")
+    
+    try:
+        summary = attendance_service.get_person_today_summary(person_id)
+        if not summary:
+            return {
+                "success": True,
+                "person_id": person_id,
+                "message": "No attendance records for today",
+                "summary": None
+            }
+        return {"success": True, "person_id": person_id, "summary": summary}
+    except Exception as e:
+        logger.error(f"Error getting person attendance: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/attendance/stats")
+async def get_attendance_stats():
+    """Get attendance database statistics."""
+    if not attendance_service:
+        return {
+            "success": False,
+            "database_available": False,
+            "message": "Attendance database not available"
+        }
+    
+    try:
+        stats = attendance_service.db.get_stats()
+        return {"success": True, "database_available": True, "stats": stats}
+    except Exception as e:
+        logger.error(f"Error getting attendance stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
